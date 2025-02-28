@@ -1420,6 +1420,13 @@ static int scmi_notifier_register(const struct scmi_handle *handle,
 	return ret;
 }
 
+int scmi_protocol_notifier_register(const struct scmi_handle *handle,
+				    struct scmi_protocol_notifier *pno)
+{
+	return scmi_notifier_register(handle, pno->proto_id, pno->evt_id,
+				      pno->src_id, pno->nb);
+}
+
 /**
  * scmi_notifier_unregister()  - Unregister a notifier_block for an event
  * @handle: The handle identifying the platform instance against which the
@@ -1475,6 +1482,13 @@ static int scmi_notifier_unregister(const struct scmi_handle *handle,
 	scmi_put_handler(ni, hndl);
 
 	return 0;
+}
+
+int scmi_protocol_notifier_unregister(const struct scmi_handle *handle,
+				      struct scmi_protocol_notifier *pno)
+{
+	return scmi_notifier_unregister(handle, pno->proto_id, pno->evt_id,
+					pno->src_id, pno->nb);
 }
 
 struct scmi_notifier_devres {
