@@ -91,6 +91,8 @@ struct scmi_xfers_info {
  * @gid: A reference for per-protocol devres management.
  * @users: A refcount to track effective users of this protocol.
  * @priv: Reference for optional protocol private data.
+ * @pno: A protocol instance notifier descriptor: active only when the
+ *	 included notifier block @nb is non-NULL.
  * @version: Protocol version supported by the platform as detected at runtime.
  * @negotiated_version: When the platform supports a newer protocol version,
  *			the agent will try to negotiate with the platform the
@@ -110,6 +112,7 @@ struct scmi_protocol_instance {
 	void				*gid;
 	refcount_t			users;
 	void				*priv;
+	struct scmi_protocol_notifier   pno;
 	unsigned int			version;
 	unsigned int			negotiated_version;
 	struct scmi_protocol_handle	ph;
@@ -1656,6 +1659,24 @@ static void *scmi_get_protocol_priv(const struct scmi_protocol_handle *ph)
 	return pi->priv;
 }
 
+static int
+scmi_register_instance_notifier(const struct scmi_protocol_handle *ph, u8 evt_id,
+				const u32 *src_id, struct notifier_block *nb)
+{
+	struct scmi_protocol_instance *pi = ph_to_pi(ph);
+
+	pi->pno.proto_id = pi->proto->id;
+	pi->pno.evt_id = evt_id;
+	pi->pno.src_id = src_id;
+	/*
+	 * Ensure the descriptor fields are visibile when the notifier block is
+	 * made available
+	 */
+	smp_store_release(&pi->pno.nb, nb);
+
+	return 0;
+}
+
 static const struct scmi_xfer_ops xfer_ops = {
 	.xfer_get_init = xfer_get_init,
 	.reset_rx_to_maxsz = reset_rx_to_maxsz,
@@ -2256,6 +2277,7 @@ scmi_alloc_init_protocol_instance(struct scmi_info *info,
 	pi->ph.hops = &helpers_ops;
 	pi->ph.set_priv = scmi_set_protocol_priv;
 	pi->ph.get_priv = scmi_get_protocol_priv;
+	pi->ph.instance_notifier_register = scmi_register_instance_notifier;
 	refcount_set(&pi->users, 1);
 
 	/*
@@ -2317,12 +2339,12 @@ out:
 static struct scmi_protocol_instance * __must_check
 scmi_get_protocol_instance(const struct scmi_handle *handle, u8 protocol_id)
 {
-	struct scmi_protocol_instance *pi;
 	struct scmi_info *info = handle_to_scmi_info(handle);
+	struct scmi_protocol_instance *pi;
 
-	mutex_lock(&info->protocols_mtx);
+	guard(mutex)(&info->protocols_mtx);
+
 	pi = idr_find(&info->protocols, protocol_id);
-
 	if (pi) {
 		refcount_inc(&pi->users);
 	} else {
@@ -2330,14 +2352,42 @@ scmi_get_protocol_instance(const struct scmi_handle *handle, u8 protocol_id)
 
 		/* Fails if protocol not registered on bus */
 		proto = scmi_protocol_get(protocol_id, &info->version);
-		if (proto)
-			pi = scmi_alloc_init_protocol_instance(info, proto);
-		else
-			pi = ERR_PTR(-EPROBE_DEFER);
+		if (!proto)
+			return ERR_PTR(-EPROBE_DEFER);
+
+		pi = scmi_alloc_init_protocol_instance(info, proto);
+		if (IS_ERR(pi))
+			return pi;
+
+		/*
+		 * A unique protocol notifier, when present, is registered
+		 * after the protocol itself and all of its supported events
+		 * have been successfully initialized.
+		 */
+		if (smp_load_acquire(&pi->pno.nb) &&
+		    scmi_protocol_notifier_register(pi->handle, &pi->pno))
+			dev_warn(handle->dev,
+				 "Failed to register protocol [0x%X] notifier\n",
+				 proto->id);
 	}
-	mutex_unlock(&info->protocols_mtx);
 
 	return pi;
+}
+
+int scmi_protocol_acquire_unlocked(const struct scmi_handle *handle, u8 protocol_id)
+{
+	struct scmi_info *info = handle_to_scmi_info(handle);
+	struct scmi_protocol_instance *pi;
+
+	lockdep_assert_held(&info->protocols_mtx);
+
+	pi = idr_find(&info->protocols, protocol_id);
+	if (WARN_ON(!pi))
+		return -ENODEV;
+
+	refcount_inc(&pi->users);
+
+	return 0;
 }
 
 /**
@@ -2355,23 +2405,32 @@ int scmi_protocol_acquire(const struct scmi_handle *handle, u8 protocol_id)
 	return PTR_ERR_OR_ZERO(scmi_get_protocol_instance(handle, protocol_id));
 }
 
-/**
- * scmi_protocol_release  - Protocol de-initialization helper.
- * @handle: A reference to the SCMI platform instance.
- * @protocol_id: The protocol being requested.
- *
- * Remove one user for the specified protocol and triggers de-initialization
- * and resources de-allocation once the last user has gone.
- */
-void scmi_protocol_release(const struct scmi_handle *handle, u8 protocol_id)
+void scmi_protocol_release_unlocked(const struct scmi_handle *handle,
+				    u8 protocol_id)
 {
 	struct scmi_info *info = handle_to_scmi_info(handle);
 	struct scmi_protocol_instance *pi;
 
-	mutex_lock(&info->protocols_mtx);
+	lockdep_assert_held(&info->protocols_mtx);
+
 	pi = idr_find(&info->protocols, protocol_id);
 	if (WARN_ON(!pi))
-		goto out;
+		return;
+
+	/*
+	 * If a protocol notifier was registered and this is the last instance
+	 * releasing the protocol, un-register the notifier: note that the
+	 * notifier itself counts as one user, as for any other regular notifier,
+	 * so if a protocol notifier was registered and there are only 2 users
+	 * active we can derive that this is the last protocol instance
+	 * de-registering.
+	 */
+	if (scmi_protocol_notifier_registered(&pi->pno) &&
+	    refcount_read(&pi->users) == 2 &&
+	    scmi_protocol_notifier_unregister(pi->handle, &pi->pno))
+		dev_err(handle->dev,
+			"Failed to release protocol [0x%X] notifier\n",
+			protocol_id);
 
 	if (refcount_dec_and_test(&pi->users)) {
 		void *gid = pi->gid;
@@ -2390,9 +2449,23 @@ void scmi_protocol_release(const struct scmi_handle *handle, u8 protocol_id)
 		dev_dbg(handle->dev, "De-Initialized protocol: 0x%X\n",
 			protocol_id);
 	}
+}
 
-out:
-	mutex_unlock(&info->protocols_mtx);
+/**
+ * scmi_protocol_release  - Protocol de-initialization helper.
+ * @handle: A reference to the SCMI platform instance.
+ * @protocol_id: The protocol being requested.
+ *
+ * Remove one user for the specified protocol and triggers de-initialization
+ * and resources de-allocation once the last user has gone.
+ */
+void scmi_protocol_release(const struct scmi_handle *handle, u8 protocol_id)
+{
+	struct scmi_info *info = handle_to_scmi_info(handle);
+
+	guard(mutex)(&info->protocols_mtx);
+
+	scmi_protocol_release_unlocked(handle, protocol_id);
 }
 
 void scmi_setup_protocol_implemented(const struct scmi_protocol_handle *ph,

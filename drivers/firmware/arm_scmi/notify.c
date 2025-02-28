@@ -1059,6 +1059,44 @@ static int scmi_register_event_handler(struct scmi_notify_instance *ni,
 	return ret;
 }
 
+static inline struct scmi_event_handler *
+scmi_create_registered_handler(struct scmi_notify_instance *ni, u32 evt_key)
+{
+	struct scmi_registered_event *r_evt;
+	struct scmi_event_handler *hndl;
+	int ret;
+
+	/* Protocol/events MUST have been registered by now */
+	r_evt = SCMI_GET_REVT(ni, KEY_XTRACT_PROTO_ID(evt_key),
+			      KEY_XTRACT_EVT_ID(evt_key));
+
+	if (WARN_ON(!r_evt))
+		return ERR_PTR(-ENODEV);
+
+	if (r_evt->not_supported_by_platform)
+		return ERR_PTR(-EOPNOTSUPP);
+
+	/* Create if still not found and required */
+	hndl = scmi_allocate_event_handler(evt_key);
+	if (!hndl)
+		return ERR_PTR(-ENOMEM);
+
+	ret = scmi_protocol_acquire_unlocked(ni->handle,
+					     KEY_XTRACT_PROTO_ID(hndl->key));
+	if (ret) {
+		scmi_put_handler_unlocked(ni, hndl);
+		return ERR_PTR(ret);
+	}
+
+	/* Being created registered it never pass by pending list */
+	hndl->r_evt = r_evt;
+
+	guard(mutex)(&r_evt->proto->registered_mtx);
+	hash_add(r_evt->proto->registered_events_handlers, &hndl->hash, hndl->key);
+
+	return hndl;
+}
+
 /**
  * __scmi_event_handler_get_ops()  - Utility to get or create an event handler
  * @ni: A reference to the notification instance to use
@@ -1437,6 +1475,67 @@ static int scmi_notifier_register(const struct scmi_handle *handle,
 }
 
 /**
+ * scmi_protocol_notifier_register  - Register the protocol notifier
+ * @handle: The handle identifying the platform instance against which the
+ *	    callback is registered
+ * @pno: The protocol notifier descriptor
+ *
+ * A protocol can optionally register a single protocol notifier callback
+ * during its initialization phase: the notifier_block will be the registered
+ * using the usual common SCMI notification framework.
+ *
+ * This custom wrapper function is used to register such a notifier since, by
+ * construction, when a protocol notifier is registered:
+ *  - it is the first notifier to be registered
+ *  - the related protocol and its events have been already initialized so this
+ *    notifier will never need to transition from the pending events list
+ *
+ * Return: 0 on Success
+ */
+int scmi_protocol_notifier_register(const struct scmi_handle *handle,
+				    struct scmi_protocol_notifier *pno)
+{
+	struct scmi_event_handler *hndl;
+	struct scmi_notify_instance *ni;
+	u32 evt_key;
+	int ret;
+
+	ni = scmi_notification_instance_data_get(handle);
+	if (!ni)
+		return -ENODEV;
+
+	/* Ensure registered was visible */
+	if (smp_load_acquire(&pno->registered))
+		return -EBUSY;
+
+	evt_key = MAKE_HASH_KEY(pno->proto_id, pno->evt_id,
+				pno->src_id ? *pno->src_id : SRC_ID_MASK);
+
+	/* This protocol handler notifier cannot exist already at this point */
+	hndl = scmi_create_registered_handler(ni, evt_key);
+	if (IS_ERR(hndl))
+		return PTR_ERR(hndl);
+
+	blocking_notifier_chain_register(&hndl->chain, pno->nb);
+	ret = scmi_event_handler_enable_events(hndl);
+	if (ret) {
+		/* When enable fails throw the handler away */
+		scmi_put_handler_unlocked(ni, hndl);
+		/* Drop protocol refcount acquired after creation */
+		scmi_protocol_release_unlocked(handle, pno->proto_id);
+		return ret;
+	}
+
+	/* Make sure registration is visible */
+	smp_store_release(&pno->registered, true);
+
+	dev_dbg(handle->dev,
+		"Registered SCMI protocol [0x%X] notifier\n", pno->proto_id);
+
+	return 0;
+}
+
+/**
  * scmi_notifier_unregister()  - Unregister a notifier_block for an event
  * @handle: The handle identifying the platform instance against which the
  *	    callback is unregistered
@@ -1489,6 +1588,61 @@ static int scmi_notifier_unregister(const struct scmi_handle *handle,
 	 * path which will finally free this unused handler.
 	 */
 	scmi_put_handler(ni, hndl);
+
+	return 0;
+}
+
+int scmi_protocol_notifier_unregister(const struct scmi_handle *handle,
+				      struct scmi_protocol_notifier *pno)
+{
+	struct scmi_registered_event *r_evt;
+	struct scmi_event_handler *hndl;
+	struct scmi_notify_instance *ni;
+	u32 evt_key;
+	bool freed;
+
+	ni = scmi_notification_instance_data_get(handle);
+	if (!ni)
+		return -ENODEV;
+
+	evt_key = MAKE_HASH_KEY(pno->proto_id, pno->evt_id,
+				pno->src_id ? *pno->src_id : SRC_ID_MASK);
+
+	r_evt = SCMI_GET_REVT(ni, KEY_XTRACT_PROTO_ID(evt_key),
+			      KEY_XTRACT_EVT_ID(evt_key));
+
+	if (WARN_ON(!r_evt))
+		return -ENODEV;
+
+	/* Make sure de-registration is visible BEFORE calling unregister */
+	smp_store_release(&pno->registered, false);
+
+	scoped_guard(mutex, &r_evt->proto->registered_mtx) {
+		hndl = KEY_FIND(r_evt->proto->registered_events_handlers,
+				hndl, evt_key);
+		if (!hndl) {
+			/* Visibly revert registered state on failure */
+			smp_store_release(&pno->registered, true);
+			return -ENOMEM;
+		}
+
+		blocking_notifier_chain_unregister(&hndl->chain, pno->nb);
+
+		freed = scmi_put_handler_unlocked(ni, hndl);
+		/* This must cause the handler to be freed at this point */
+		WARN_ON(!freed);
+	}
+
+	/*
+	 * Releasing the protocol for this notifier only here AFTER unlocking
+	 * registered_mtx, since releasing the protocol itself can trigger its
+	 * de-initialization (ie. including r_evt and registered_mtx)
+	 */
+	if (freed)
+		scmi_protocol_release_unlocked(handle, pno->proto_id);
+
+	dev_dbg(handle->dev,
+		"Unregistered SCMI protocol [0x%X] notifier\n", pno->proto_id);
 
 	return 0;
 }
