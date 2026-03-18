@@ -3683,6 +3683,7 @@ static int __init scmi_driver_init(void)
 	scmi_system_register();
 	scmi_powercap_register();
 	scmi_pinctrl_register();
+	scmi_telemetry_register();
 
 	return platform_driver_register(&scmi_driver);
 }
@@ -3701,6 +3702,7 @@ static void __exit scmi_driver_exit(void)
 	scmi_system_unregister();
 	scmi_powercap_unregister();
 	scmi_pinctrl_unregister();
+	scmi_telemetry_unregister();
 
 	platform_driver_unregister(&scmi_driver);
 
