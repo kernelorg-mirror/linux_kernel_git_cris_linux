@@ -2,13 +2,14 @@
 /*
  * SCMI Message Protocol driver header
  *
- * Copyright (C) 2018-2021 ARM Ltd.
+ * Copyright (C) 2018-2026 ARM Ltd.
  */
 
 #ifndef _LINUX_SCMI_PROTOCOL_H
 #define _LINUX_SCMI_PROTOCOL_H
 
 #include <linux/bitfield.h>
+#include <linux/bitops.h>
 #include <linux/device.h>
 #include <linux/notifier.h>
 #include <linux/types.h>
@@ -824,6 +825,35 @@ struct scmi_pinctrl_proto_ops {
 	int (*pin_free)(const struct scmi_protocol_handle *ph, u32 pin);
 };
 
+struct scmi_telemetry_base_info {
+	unsigned int version;
+	uuid_t primary_revision;
+	unsigned int num_des;
+	unsigned int num_groups;
+	unsigned int num_intervals;
+	unsigned int num_shmtis;
+};
+
+struct scmi_telemetry_info {
+	bool single_read_support;
+	bool continuous_update_support;
+	bool per_group_config_support;
+	bool reset_support;
+	bool fc_support;
+	struct scmi_telemetry_base_info base;
+};
+
+/**
+ * struct scmi_telemetry_proto_ops - represents the various operations provided
+ *	by SCMI Telemetry Protocol
+ *
+ * @info_get: get the general Telemetry information.
+ */
+struct scmi_telemetry_proto_ops {
+	const struct scmi_telemetry_info __must_check *(*info_get)
+		(const struct scmi_protocol_handle *ph);
+};
+
 /**
  * struct scmi_notify_ops  - represents notifications' operations provided by
  * SCMI core
@@ -930,6 +960,7 @@ enum scmi_std_protocol {
 	SCMI_PROTOCOL_VOLTAGE = 0x17,
 	SCMI_PROTOCOL_POWERCAP = 0x18,
 	SCMI_PROTOCOL_PINCTRL = 0x19,
+	SCMI_PROTOCOL_TELEMETRY = 0x1b,
 };
 
 enum scmi_system_events {
