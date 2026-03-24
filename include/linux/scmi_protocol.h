@@ -981,7 +981,7 @@ struct scmi_telemetry_info {
 	struct scmi_telemetry_intervals *intervals;
 	struct scmi_telemetry_shmti_info **shmtis;
 	unsigned int num_uuids;
-	uuid_t **uuids;
+	uuid_t * __rcu *uuids;
 	bool enabled;
 	bool notif_enabled;
 	enum scmi_telemetry_collection current_mode;
