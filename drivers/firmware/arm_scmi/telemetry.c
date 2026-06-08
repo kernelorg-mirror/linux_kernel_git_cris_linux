@@ -18,6 +18,7 @@
 #include <linux/jhash.h>
 #include <linux/io.h>
 #include <linux/limits.h>
+#include <linux/lockdep.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -30,6 +31,7 @@
 #include <linux/time.h>
 #include <linux/uuid.h>
 #include <linux/xarray.h>
+#include <linux/wait.h>
 
 #include "errors.h"
 #include "protocols.h"
@@ -40,6 +42,7 @@
 /* Updated only after ALL the mandatory features for that version are merged */
 #define SCMI_PROTOCOL_SUPPORTED_VERSION		0x10000
 
+#define SCMI_TLM_GENERATION_ONE		(SCMI_TLM_GENERATION_INVALID + 1U)
 #define SCMI_TLM_TDCF_MAX_RETRIES	15
 #define SCMI_TLM_TDCF_RETRY_GAP_US	1234
 
@@ -819,6 +822,32 @@ scmi_telemetry_tde_cache_lookup(struct telemetry_de *tde,
 			       sample->val, "CACHED_DE_READ");
 
 	return 0;
+}
+
+static inline void __scmi_telemetry_generation_set(struct telemetry_info *ti,
+						   unsigned int new)
+{
+	int ret;
+
+	atomic_set_release(&ti->info.generation, new);
+
+	ret = scmi_telemetry_event_signal(ti, SCMI_TLM_EVT_GENERATION);
+	if (ret)
+		dev_warn_once(ti->ph->dev,
+			      "Could NOT signal telemetry event %d\n",
+			      SCMI_TLM_EVT_GENERATION);
+}
+
+static inline void scmi_telemetry_generation_update(struct telemetry_info *ti)
+{
+	unsigned int next;
+
+	lockdep_assert_held(&ti->config_mtx);
+
+	/* Wrap around skipping invalid generation 0 */
+	next = (atomic_read(&ti->info.generation) + 1) ?: SCMI_TLM_GENERATION_ONE;
+
+	__scmi_telemetry_generation_set(ti, next);
 }
 
 struct scmi_tlm_de_priv {
@@ -3386,6 +3415,9 @@ scmi_telemetry_remote_state_update_needed(struct telemetry_info *ti,
 						  is_group ? obj : NULL,
 						  !is_group ? obj : NULL);
 
+		/* A local change can have an impact anyway */
+		scmi_telemetry_generation_update(ti);
+
 		return false;
 	}
 
@@ -3495,6 +3527,8 @@ static int scmi_telemetry_tde_state_set(const struct scmi_protocol_handle *ph,
 			dev_err(ph->dev,
 				"Could NOT process DE ID 0x%08X state response - ret:%d\n",
 				tde->de.info->id, ret);
+
+		scmi_telemetry_generation_update(ti);
 	}
 
 	ph->xops->xfer_put(ph, t);
@@ -3545,6 +3579,8 @@ static int scmi_telemetry_group_state_set(const struct scmi_protocol_handle *ph,
 			dev_err(ph->dev,
 				"Could NOT process GROUP %u state response - ret:%d\n",
 				grp->info->grp_id, ret);
+
+		scmi_telemetry_generation_update(ti);
 	}
 
 	ph->xops->xfer_put(ph, t);
@@ -3704,6 +3740,9 @@ scmi_telemetry_collection_configure(const struct scmi_protocol_handle *ph,
 	}
 
 	ph->xops->xfer_put(ph, t);
+
+	if (!ret)
+		scmi_telemetry_generation_update(ti);
 
 	return ret;
 }
@@ -4347,8 +4386,11 @@ static int scmi_telemetry_reset(const struct scmi_protocol_handle *ph)
 
 	put_unaligned_le32(0, t->tx.buf);
 	ret = ph->xops->do_xfer(ph, t);
-	if (!ret)
+	if (!ret) {
 		scmi_telemetry_local_resources_reset(ti);
+		/* Cumulative generation tick */
+		scmi_telemetry_generation_update(ti);
+	}
 
 	ph->xops->xfer_put(ph, t);
 
@@ -4954,6 +4996,8 @@ static int scmi_telemetry_instance_init(struct telemetry_info *ti)
 		INIT_LIST_HEAD(&ti->events[i]);
 	mutex_init(&ti->events_mtx);
 
+	/* Generation counter init */
+	atomic_set(&ti->info.generation, SCMI_TLM_GENERATION_ONE);
 	atomic_set(&ti->des_enabled[ENA_STATE], 0);
 	atomic_set(&ti->des_enabled[ENA_TSTAMP], 0);
 	mutex_init(&ti->des_enabled_mtx);
