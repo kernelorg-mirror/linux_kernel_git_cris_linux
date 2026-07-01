@@ -912,7 +912,7 @@ static void scmi_vio_remove(struct virtio_device *vdev)
 
 	/* Ensure scmi_vdev is visible as NULL */
 	smp_store_mb(scmi_vdev, NULL);
-	scmi_transport_supplier_put(&scmi_virtio_supplier.th, &vdev->dev);
+	scmi_transport_supplier_drop(&scmi_virtio_supplier.th, &vdev->dev);
 }
 
 static int scmi_vio_validate(struct virtio_device *vdev)

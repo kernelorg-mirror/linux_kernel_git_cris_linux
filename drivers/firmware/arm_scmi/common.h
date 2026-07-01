@@ -561,11 +561,29 @@ scmi_transport_supplier_put(const struct scmi_transport_handle *th,
 		sup->available = supplier;
 		break;
 	case 0:
-		/* Putting a supplier when in the AVAILABLE state causes a
-		 * transition back to the NOT_READY state, BUT only if the
-		 * supplier we are disposing of was exactly the device that was
-		 * previously made readily available.
-		 */
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static inline int
+scmi_transport_supplier_drop(const struct scmi_transport_handle *th,
+			     struct device *supplier)
+{
+	struct scmi_transport_supplier *sup = to_sup(th);
+
+	/* Nothing to do when the provided supplier was never real */
+	if (IS_ERR_OR_NULL(supplier))
+		return 0;
+
+	guard(mutex)(&sup->mtx);
+	switch (PTR_ERR_OR_ZERO(sup->available)) {
+	case -EPROBE_DEFER:
+	case -EBUSY:
+		return -EINVAL;
+	case 0:
 		if (supplier != sup->available)
 			return -EINVAL;
 		sup->available = ERR_PTR(-EPROBE_DEFER);

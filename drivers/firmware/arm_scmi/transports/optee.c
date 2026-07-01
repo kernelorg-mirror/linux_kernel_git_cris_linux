@@ -595,7 +595,7 @@ static void scmi_optee_service_remove(struct tee_client_device *scmi_pta)
 
 	/* Ensure cleared reference is visible before resources are released */
 	smp_store_mb(scmi_optee_private, NULL);
-	scmi_transport_supplier_put(&scmi_optee_supplier.th, agent->dev);
+	scmi_transport_supplier_drop(&scmi_optee_supplier.th, agent->dev);
 
 	tee_client_close_context(agent->tee_ctx);
 }
