@@ -375,7 +375,7 @@ static unsigned int virtio_get_max_msg(struct scmi_chan_info *base_cinfo)
 	return vioch->max_msg;
 }
 
-static bool virtio_chan_available(struct device_node *of_node, int idx)
+static bool virtio_chan_available(struct device_node *of_node, int idx, void *thndl)
 {
 	struct scmi_vio_channel *channels, *vioch = NULL;
 
@@ -409,7 +409,7 @@ static void scmi_destroy_tx_workqueue(void *deferred_tx_wq)
 }
 
 static int virtio_chan_setup(struct scmi_chan_info *cinfo, struct device *dev,
-			     bool tx)
+			     bool tx, void *thndl)
 {
 	struct scmi_vio_channel *vioch;
 	int index = tx ? VIRTIO_SCMI_VQ_TX : VIRTIO_SCMI_VQ_RX;

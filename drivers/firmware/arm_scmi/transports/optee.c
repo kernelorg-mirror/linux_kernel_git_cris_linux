@@ -314,7 +314,7 @@ static int invoke_process_msg_channel(struct scmi_optee_channel *channel, size_t
 	return 0;
 }
 
-static bool scmi_optee_chan_available(struct device_node *of_node, int idx)
+static bool scmi_optee_chan_available(struct device_node *of_node, int idx, void *thndl)
 {
 	u32 channel_id;
 
@@ -369,7 +369,8 @@ static int setup_shmem(struct device *dev, struct scmi_chan_info *cinfo,
 		return setup_dynamic_shmem(dev, channel);
 }
 
-static int scmi_optee_chan_setup(struct scmi_chan_info *cinfo, struct device *dev, bool tx)
+static int scmi_optee_chan_setup(struct scmi_chan_info *cinfo, struct device *dev,
+				 bool tx, void *thndl)
 {
 	struct scmi_optee_channel *channel;
 	uint32_t channel_id;

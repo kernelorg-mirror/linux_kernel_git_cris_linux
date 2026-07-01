@@ -121,6 +121,7 @@ struct scmi_protocol_instance {
  *
  * @id: A sequence number starting from zero identifying this instance
  * @dev: Device pointer
+ * @thndl: A transport instance handle
  * @desc: SoC description for this instance
  * @version: SCMI revision information containing protocol version,
  *	implementation version and (sub-)vendor identification.
@@ -151,6 +152,7 @@ struct scmi_protocol_instance {
 struct scmi_info {
 	int id;
 	struct device *dev;
+	void *thndl;
 	const struct scmi_desc *desc;
 	struct scmi_base_info version;
 	struct scmi_handle handle;
@@ -2751,7 +2753,7 @@ static int scmi_chan_setup(struct scmi_info *info, struct device_node *of_node,
 	idx = tx ? 0 : 1;
 	idr = tx ? &info->tx_idr : &info->rx_idr;
 
-	if (!info->desc->ops->chan_available(of_node, idx)) {
+	if (!info->desc->ops->chan_available(of_node, idx, info->thndl)) {
 		cinfo = idr_find(idr, SCMI_PROTOCOL_BASE);
 		if (unlikely(!cinfo)) /* Possible only if platform has no Rx */
 			return -EINVAL;
@@ -2782,7 +2784,7 @@ static int scmi_chan_setup(struct scmi_info *info, struct device_node *of_node,
 
 	cinfo->id = prot_id;
 	cinfo->dev = &tdev->dev;
-	ret = info->desc->ops->chan_setup(cinfo, info->dev, tx);
+	ret = info->desc->ops->chan_setup(cinfo, info->dev, tx, info->thndl);
 	if (ret) {
 		of_node_put(of_node);
 		scmi_device_destroy(info->dev, prot_id, name);
@@ -3146,7 +3148,8 @@ static int scmi_debugfs_raw_mode_setup(struct scmi_info *info)
 	return ret;
 }
 
-static const struct scmi_desc *scmi_transport_setup(struct device *dev)
+static const struct scmi_desc *
+scmi_transport_setup(struct device *dev, void **thndl)
 {
 	struct scmi_transport *trans;
 	int ret;
@@ -3196,6 +3199,8 @@ static const struct scmi_desc *scmi_transport_setup(struct device *dev)
 			 "SCMI System wide atomic threshold set to %u us\n",
 			 trans->desc.atomic_threshold);
 
+	*thndl = trans->supplier;
+
 	return &trans->desc;
 }
 
@@ -3221,8 +3226,9 @@ static int scmi_probe(struct platform_device *pdev)
 	bool coex = IS_ENABLED(CONFIG_ARM_SCMI_RAW_MODE_SUPPORT_COEX);
 	struct device *dev = &pdev->dev;
 	struct device_node *child, *np = dev->of_node;
+	void *thndl;
 
-	desc = scmi_transport_setup(dev);
+	desc = scmi_transport_setup(dev, &thndl);
 	if (!desc) {
 		err_str = "transport invalid\n";
 		ret = -EINVAL;
@@ -3239,6 +3245,7 @@ static int scmi_probe(struct platform_device *pdev)
 
 	info->dev = dev;
 	info->desc = desc;
+	info->thndl = thndl;
 	info->bus_nb.notifier_call = scmi_bus_notifier;
 	info->dev_req_nb.notifier_call = scmi_device_request_notifier;
 	INIT_LIST_HEAD(&info->node);

@@ -77,7 +77,7 @@ static void rx_callback(struct mbox_client *cl, void *m)
 		      core->shmem->read_header(smbox->shmem), NULL);
 }
 
-static bool mailbox_chan_available(struct device_node *of_node, int idx)
+static bool mailbox_chan_available(struct device_node *of_node, int idx, void *thndl)
 {
 	int num_mb;
 
@@ -180,7 +180,7 @@ static int mailbox_chan_validate(struct device *cdev, int *a2p_rx_chan,
 }
 
 static int mailbox_chan_setup(struct scmi_chan_info *cinfo, struct device *dev,
-			      bool tx)
+			      bool tx, void *thndl)
 {
 	const char *desc = tx ? "Tx" : "Rx";
 	struct device *cdev = cinfo->dev;
