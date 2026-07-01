@@ -521,8 +521,13 @@ struct scmi_transport {
 struct scmi_transport_supplier {
 	/* Protect @available */
 	struct mutex mtx;
-	struct device *available;
+	struct list_head available;
 	const struct scmi_transport_handle th;
+};
+
+struct scmi_transport_instance {
+	void *supplier;
+	struct list_head node;
 };
 
 #define to_sup(t)	container_of(t, struct scmi_transport_supplier, th)
@@ -549,21 +554,19 @@ scmi_transport_supplier_put(const struct scmi_transport_handle *th,
 			    struct device *supplier)
 {
 	struct scmi_transport_supplier *sup = to_sup(th);
+	struct scmi_transport_instance *inst;
 
 	/* Nothing to do when the provided supplier was never real */
 	if (IS_ERR_OR_NULL(supplier))
-		return 0;
-
-	guard(mutex)(&sup->mtx);
-	switch (PTR_ERR_OR_ZERO(sup->available)) {
-	case -EPROBE_DEFER:
-	case -EBUSY:
-		sup->available = supplier;
-		break;
-	case 0:
-	default:
 		return -EINVAL;
-	}
+
+	inst = kzalloc_obj(*inst);
+	if (!inst)
+		return -ENOMEM;
+
+	inst->supplier = supplier;
+	guard(mutex)(&sup->mtx);
+	list_add(&inst->node, &sup->available);
 
 	return 0;
 }
@@ -573,23 +576,19 @@ scmi_transport_supplier_drop(const struct scmi_transport_handle *th,
 			     struct device *supplier)
 {
 	struct scmi_transport_supplier *sup = to_sup(th);
+	struct scmi_transport_instance *inst, *n;
 
 	/* Nothing to do when the provided supplier was never real */
 	if (IS_ERR_OR_NULL(supplier))
-		return 0;
+		return -EINVAL;
 
 	guard(mutex)(&sup->mtx);
-	switch (PTR_ERR_OR_ZERO(sup->available)) {
-	case -EPROBE_DEFER:
-	case -EBUSY:
-		return -EINVAL;
-	case 0:
-		if (supplier != sup->available)
-			return -EINVAL;
-		sup->available = ERR_PTR(-EPROBE_DEFER);
-		break;
-	default:
-		return -EINVAL;
+	list_for_each_entry_safe(inst, n, &sup->available, node) {
+		if (inst->supplier == supplier) {
+			list_del(&inst->node);
+			kfree(inst);
+			break;
+		}
 	}
 
 	return 0;
@@ -613,12 +612,18 @@ static inline struct device *
 scmi_transport_supplier_get(const struct scmi_transport_handle *th)
 {
 	struct scmi_transport_supplier *sup = to_sup(th);
+	struct scmi_transport_instance *inst;
 	struct device *supplier;
 
 	guard(mutex)(&sup->mtx);
-	supplier = sup->available;
-	if (!IS_ERR(sup->available))
-		sup->available = ERR_PTR(-EBUSY);
+	inst = list_first_entry_or_null(&sup->available,
+					struct scmi_transport_instance, node);
+	if (!inst)
+		return ERR_PTR(-EPROBE_DEFER);
+
+	supplier = inst->supplier;
+	list_del(&inst->node);
+	kfree(inst);
 
 	return supplier;
 }
@@ -626,7 +631,7 @@ scmi_transport_supplier_get(const struct scmi_transport_handle *th)
 #define DEFINE_SCMI_TRANSPORT_SUPPLIER(__supplier)		\
 struct scmi_transport_supplier __supplier = {			\
 	.mtx = __MUTEX_INITIALIZER(__supplier.mtx),		\
-	.available = INIT_ERR_PTR(-EPROBE_DEFER),		\
+	.available = LIST_HEAD_INIT(__supplier.available),	\
 	.th.supplier_get = scmi_transport_supplier_get,		\
 	.th.supplier_put = scmi_transport_supplier_put,		\
 }
