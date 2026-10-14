@@ -826,6 +826,22 @@ struct scmi_pinctrl_proto_ops {
 	int (*pin_free)(const struct scmi_protocol_handle *ph, u32 pin);
 };
 
+#define SCMI_TLM_GRP_INVALID		0xFFFFFFFF
+
+struct scmi_telemetry_grp_info {
+	unsigned int grp_id;
+	unsigned int num_des;
+	unsigned int num_intervals;
+};
+
+struct scmi_telemetry_group {
+	bool enabled;
+	bool tstamp_enabled;
+	unsigned int *des;
+	char *des_str;
+	struct scmi_telemetry_grp_info *info;
+};
+
 struct scmi_telemetry_de_info {
 	unsigned int id;
 	unsigned int grp_id;
@@ -846,6 +862,7 @@ struct scmi_telemetry_de {
 	bool fc_support;
 	bool name_support;
 	struct scmi_telemetry_de_info *info;
+	struct scmi_telemetry_group *grp;
 	bool enabled;
 	bool tstamp_enabled;
 };
@@ -855,6 +872,9 @@ struct scmi_telemetry_res_info {
 	unsigned int num_des;
 	struct scmi_telemetry_de **des;
 	struct scmi_telemetry_de_info *dei_store;
+	unsigned int num_groups;
+	struct scmi_telemetry_group *grps __counted_by_ptr(num_groups);
+	struct scmi_telemetry_grp_info *grps_store;
 };
 
 struct scmi_telemetry_base_info {
