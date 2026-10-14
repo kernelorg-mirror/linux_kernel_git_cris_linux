@@ -16,6 +16,7 @@
 #include <linux/limits.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/sprintf.h>
 #include <linux/string.h>
@@ -54,6 +55,19 @@ struct scmi_msg_resp_telemetry_protocol_attributes {
 #define SUPPORTS_RESET(x)		(le32_get_bits((x), BIT(17)))
 #define SUPPORTS_FC(x)			(le32_get_bits((x), BIT(16)))
 	__le32 default_blk_ts_rate;
+};
+
+struct scmi_shmti_desc {
+	__le32 id;
+	__le32 addr_low;
+	__le32 addr_high;
+	__le32 length;
+	__le32 flags;
+};
+
+struct scmi_msg_resp_telemetry_shmti_list {
+	__le32 num_shmti;
+	struct scmi_shmti_desc desc[];
 };
 
 struct de_desc_fastchannel {
@@ -107,6 +121,72 @@ struct scmi_msg_resp_telemetry_update_intervals {
 	__le32 intervals[];
 };
 
+/* TDCF */
+
+#define _I(__a)		(ioread32((void __iomem *)(__a)))
+
+struct prlg {
+	__le32 sign_start;
+#define SIGNATURE_START	0x5442474E	/* TBGN */
+	__le32 match_start;
+	__le32 num_qwords;
+	__le32 hdr_meta_1;
+#define TDCF_REVISION_GET(x)	(le32_get_bits((x)->hdr_meta_1, GENMASK(7, 0)))
+};
+
+struct eplg {
+	__le32 match_end;
+	__le32 sign_end;
+#define SIGNATURE_END	0x54454E44	/* TEND */
+};
+
+#define TDCF_EPLG_SZ	(sizeof(struct eplg))
+
+struct tdcf {
+	struct prlg prlg;
+	unsigned char payld[];
+};
+
+#define SHMTI_MIN_SIZE	(sizeof(struct tdcf) + TDCF_EPLG_SZ)
+/* An arbitrary upper bound to avoid crazy allocations driven by buggy FW */
+#define SHMTI_MAX_SIZE	SZ_64K
+
+#define TDCF_START_SIGNATURE(x)	(_I(&((x)->prlg.sign_start)))
+#define TDCF_END_SIGNATURE(e)	(_I(&((e)->sign_end)))
+
+struct telemetry_shmti;
+
+struct shmti_snap {
+	struct telemetry_shmti *shmti;
+	u32 magic;
+	u8 base[] __aligned(8);
+};
+
+struct telemetry_shmti {
+	u32 flags;
+	void __iomem *base;
+	struct scmi_telemetry_shmti_info info;
+	/* Protect srcu operation */
+	struct mutex lock;
+	struct srcu_struct srcu;
+	struct shmti_snap *snaps[2];
+	struct shmti_snap __rcu	*cur;
+	/* Mutex to protect @xa_lines */
+	struct mutex lines_mtx;
+	struct xarray xa_lines;
+	#define PAYLD_HASH_BITS  4
+	struct mutex payld_locks[1 << PAYLD_HASH_BITS];
+};
+
+#define SHMTI_EPLG(s)						\
+	({							\
+		struct telemetry_shmti *_s = (s);		\
+		struct eplg __iomem *_eplg;			\
+								\
+		_eplg = _s->base + _s->info.len - TDCF_EPLG_SZ;	\
+		(_eplg);					\
+	})
+
 #define IS_TDE_TSTAMP_TYPE(__t, __ttype)	((__t)->ts_type == (__ttype))
 #define IS_TDE_TS_NONE(_t)	(IS_TDE_TSTAMP_TYPE((_t), TSTAMP_NONE))
 #define IS_TDE_TS_LINE(_t)	(IS_TDE_TSTAMP_TYPE((_t), TSTAMP_LINE))
@@ -135,6 +215,7 @@ struct telemetry_de {
 	u32 ts_rate;
 	bool enumerated;
 	void __iomem *base;
+	struct eplg __iomem *eplg;
 	u32 sid;
 	u32 offset;
 	/* NOTE THAT DE data_sz is registered in scmi_telemetry_de */
@@ -153,6 +234,7 @@ struct telemetry_info {
 	unsigned int num_des_tstamp;
 	unsigned int default_blk_ts_rate;
 	const struct scmi_protocol_handle *ph;
+	struct telemetry_shmti *shmti;
 	struct telemetry_de *tdes;
 	struct xarray xa_des;
 	/* Mutex to protect access to @free_des */
@@ -878,6 +960,211 @@ scmi_telemetry_enumerate_common_intervals(struct telemetry_info *ti)
 					ti->info.intervals);
 }
 
+static int iter_shmti_update_state(struct scmi_iterator_state *st,
+				   const void *response, void *priv)
+{
+	const struct scmi_msg_resp_telemetry_shmti_list *r = response;
+
+	st->num_returned = le32_get_bits(r->num_shmti, GENMASK(15, 0));
+	st->num_remaining = le32_get_bits(r->num_shmti, GENMASK(31, 16));
+
+	if (st->rx_len < (sizeof(*r) + sizeof(r->desc[0]) * st->num_returned))
+		return -EINVAL;
+
+	return 0;
+}
+
+static inline int
+scmi_telemetry_shmti_validate(struct device *dev, struct telemetry_shmti *shmti)
+{
+	struct tdcf __iomem *tdcf = shmti->base;
+	u32 sign_start, sign_end;
+
+	sign_start = TDCF_START_SIGNATURE(tdcf);
+	sign_end = TDCF_END_SIGNATURE(SHMTI_EPLG(shmti));
+
+	if (sign_start != SIGNATURE_START || sign_end != SIGNATURE_END) {
+		dev_err(dev,
+			"BAD signature for SHMTI ID:%u @phys:%pa - START:0x%08X END:0x%08X\n",
+			shmti->info.sid, &shmti->info.phys, sign_start, sign_end);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int iter_shmti_process_response(const struct scmi_protocol_handle *ph,
+				       const void *response,
+				       struct scmi_iterator_state *st,
+				       void *priv)
+{
+	const struct scmi_msg_resp_telemetry_shmti_list *r = response;
+	struct telemetry_info *ti = priv;
+	struct telemetry_shmti *shmti;
+	const struct scmi_shmti_desc *desc;
+	void __iomem *addr;
+	phys_addr_t phys_addr;
+	size_t len;
+	int ret;
+
+	desc = &r->desc[st->loop_idx];
+	shmti = &ti->shmti[st->desc_index + st->loop_idx];
+
+	shmti->info.sid = le32_to_cpu(desc->id);
+	shmti->flags = le32_to_cpu(desc->flags);
+
+	ret = scmi_telemetry_area_check(ph->dev, "SHMTI",
+					le32_to_cpu(desc->addr_low),
+					le32_to_cpu(desc->addr_high),
+					le32_to_cpu(desc->length),
+					&phys_addr, &len);
+	if (ret) {
+		dev_err(ph->dev, "Malformed SHMTI ID:%u. Abort.\n",
+			shmti->info.sid);
+		return ret;
+	}
+
+	if (len < SHMTI_MIN_SIZE || len > SHMTI_MAX_SIZE) {
+		dev_err(ph->dev,
+			FW_BUG "Invalid length for SHMTI ID:%u len:%zu. Abort.\n",
+			shmti->info.sid, len);
+		return -EINVAL;
+	}
+
+	/* SHMTI base phys_addr SHOULD be 64bit aligned by the SCMI spec */
+	if (!IS_ALIGNED(phys_addr, 8))
+		dev_warn(ph->dev,
+			 "SHMTI ID:%u is NOT 64bit aligned (paddr:0x%llX)\n",
+			 shmti->info.sid, phys_addr);
+
+	addr = devm_ioremap(ph->dev, phys_addr, len);
+	if (!addr)
+		return -EADDRNOTAVAIL;
+
+	shmti->base = addr;
+	shmti->info.len = len;
+	shmti->info.phys = phys_addr;
+	shmti->info.offset = shmti->info.phys & ~PAGE_MASK;
+
+	ret = scmi_telemetry_shmti_validate(ph->dev, shmti);
+	if (ret)
+		return ret;
+
+	ti->num_shmti++;
+
+	return 0;
+}
+
+static int scmi_telemetry_shmti_list(const struct scmi_protocol_handle *ph,
+				     struct telemetry_info *ti)
+{
+	struct scmi_iterator_ops ops = {
+		.prepare_message = iter_tlm_prepare_message,
+		.update_state = iter_shmti_update_state,
+		.process_response = iter_shmti_process_response,
+	};
+	int num_shmti;
+	void *iter;
+	int ret;
+
+	/* Save and zero...calculate real number of returned */
+	num_shmti = ti->num_shmti;
+	ti->num_shmti = 0;
+	iter = ph->hops->iter_response_init(ph, &ops, num_shmti,
+					    TELEMETRY_LIST_SHMTI,
+					    sizeof(u32), ti);
+	if (IS_ERR(iter))
+		return PTR_ERR(iter);
+
+	ret = ph->hops->iter_response_run(iter);
+	if (ret)
+		return ret;
+
+	if (num_shmti != ti->num_shmti)
+		dev_warn(ph->dev,
+			 FW_BUG "SHMTI enumeration returned %u items, expected %u\n",
+			 ti->num_shmti, num_shmti);
+
+	return 0;
+}
+
+static void scmi_telemetry_shmti_cleanup(void *arg)
+{
+	struct telemetry_shmti *shmti = arg;
+
+	cleanup_srcu_struct(&shmti->srcu);
+
+	kvfree(shmti->snaps[0]);
+	kvfree(shmti->snaps[1]);
+
+	xa_destroy(&shmti->xa_lines);
+}
+
+static int scmi_telemetry_shmti_init(struct device *dev,
+				     struct telemetry_shmti *shmti)
+{
+	int ret;
+
+	struct shmti_snap *s0 __free(kvfree) =
+		kvzalloc_flex(*s0, base, shmti->info.len);
+	if (!s0)
+		return -ENOMEM;
+
+	struct shmti_snap *s1 __free(kvfree) =
+		kvzalloc_flex(*s1, base, shmti->info.len);
+	if (!s1)
+		return -ENOMEM;
+
+	ret = init_srcu_struct(&shmti->srcu);
+	if (ret)
+		return ret;
+
+	for (int i = 0; i < 1 << PAYLD_HASH_BITS; i++)
+		mutex_init(&shmti->payld_locks[i]);
+
+	mutex_init(&shmti->lock);
+	RCU_INIT_POINTER(shmti->cur, NULL);
+
+	mutex_init(&shmti->lines_mtx);
+	xa_init(&shmti->xa_lines);
+
+	s0->shmti = shmti;
+	shmti->snaps[0] = no_free_ptr(s0);
+
+	s1->shmti = shmti;
+	shmti->snaps[1] = no_free_ptr(s1);
+
+	return devm_add_action_or_reset(dev, scmi_telemetry_shmti_cleanup, shmti);
+}
+
+static int scmi_telemetry_enumerate_shmti(struct telemetry_info *ti)
+{
+	const struct scmi_protocol_handle *ph = ti->ph;
+	int ret;
+
+	if (!ti->num_shmti)
+		return 0;
+
+	ret = scmi_telemetry_shmti_list(ph, ti);
+	if (ret) {
+		dev_err(ph->dev, "Cannot get SHMTI list descriptors");
+		return ret;
+	}
+
+	for (int i = 0; i < ti->num_shmti; i++) {
+		ret = scmi_telemetry_shmti_init(ph->dev, &ti->shmti[i]);
+		if (ret)
+			return ret;
+
+		ti->info.shmtis[i] = &ti->shmti[i].info;
+	}
+
+	/* Expose the fully initialized SHMTI infos */
+	smp_store_release(&ti->info.base.num_shmtis, ti->num_shmti);
+
+	return 0;
+}
+
 static const struct scmi_telemetry_info *
 scmi_telemetry_info_get(const struct scmi_protocol_handle *ph)
 {
@@ -931,7 +1218,20 @@ static const struct scmi_telemetry_proto_ops tlm_proto_ops = {
  * Return: 0 on Success, errno otherwise
  */
 static int scmi_telemetry_resources_alloc(struct telemetry_info *ti)
+
 {
+	/* Array to hold SHMTIs descriptors */
+	struct telemetry_shmti *shmtis __free(kfree) =
+		kzalloc_objs(*shmtis, ti->num_shmti);
+	if (!shmtis)
+		return -ENOMEM;
+
+	/* Array of initialized SHMTIs references */
+	struct scmi_telemetry_shmti_info **shmtis_info __free(kfree) =
+		kzalloc_objs(*shmtis_info, ti->num_shmti);
+	if (!shmtis_info)
+		return -ENOMEM;
+
 	/* Array to hold pointers to discovered DEs */
 	struct scmi_telemetry_de **des __free(kfree) =
 		kzalloc_objs(*des, ti->info.base.num_des);
@@ -984,6 +1284,9 @@ static int scmi_telemetry_resources_alloc(struct telemetry_info *ti)
 
 	INIT_LIST_HEAD(&ti->fcs_des);
 
+	ti->shmti = no_free_ptr(shmtis);
+	ti->info.shmtis = no_free_ptr(shmtis_info);
+
 	ti->tdes = no_free_ptr(tdes);
 
 	rinfo->des = no_free_ptr(des);
@@ -1012,6 +1315,9 @@ static void scmi_telemetry_resources_free(struct telemetry_info *ti)
 	rinfo = __scmi_telemetry_resources_get(ti);
 	/* Ensure rinfo is no more accessible upfront */
 	smp_store_release(&ti->rinfo, NULL);
+
+	kfree(ti->info.shmtis);
+	kfree(ti->shmti);
 
 	kfree(ti->tdes);
 
@@ -1202,6 +1508,12 @@ static int scmi_telemetry_protocol_init(const struct scmi_protocol_handle *ph)
 	ret = scmi_telemetry_enumerate_common_intervals(ti);
 	if (ret) {
 		dev_err(dev, FW_BUG "Cannot enumerate update intervals. Abort.\n");
+		return ret;
+	}
+
+	ret = scmi_telemetry_enumerate_shmti(ti);
+	if (ret) {
+		dev_err(dev, FW_BUG "Cannot enumerate SHMTIs. Abort.\n");
 		return ret;
 	}
 
