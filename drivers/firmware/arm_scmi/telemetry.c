@@ -55,6 +55,19 @@ struct scmi_msg_resp_telemetry_protocol_attributes {
 	__le32 default_blk_ts_rate;
 };
 
+struct scmi_shmti_desc {
+	__le32 id;
+	__le32 addr_low;
+	__le32 addr_high;
+	__le32 length;
+	__le32 flags;
+};
+
+struct scmi_msg_resp_telemetry_shmti_list {
+	__le32 num_shmti;
+	struct scmi_shmti_desc desc[];
+};
+
 struct de_desc_fastchannel {
 	__le32 addr_low;
 	__le32 addr_high;
@@ -106,6 +119,53 @@ struct scmi_msg_resp_telemetry_update_intervals {
 	__le32 intervals[];
 };
 
+/* TDCF */
+
+#define _I(__a)		(ioread32((void __iomem *)(__a)))
+
+struct prlg {
+	u32 sign_start;
+#define SIGNATURE_START	0x5442474E	/* TBGN */
+	u32 match_start;
+	u32 num_qwords;
+	u32 hdr_meta_1;
+#define TDCF_REVISION_GET(x)	(le32_get_bits((x)->hdr_meta_1, GENMASK(7, 0)))
+};
+
+struct eplg {
+	u32 match_end;
+	u32 sign_end;
+#define SIGNATURE_END	0x54454E44	/* TEND */
+};
+
+#define TDCF_EPLG_SZ	(sizeof(struct eplg))
+
+struct tdcf {
+	struct prlg prlg;
+	unsigned char payld[];
+};
+
+#define SHMTI_MIN_SIZE	(sizeof(struct tdcf) + TDCF_EPLG_SZ)
+
+#define TDCF_START_SIGNATURE(x)	(_I(&((x)->prlg.sign_start)))
+#define TDCF_END_SIGNATURE(e)	(_I(&((e)->sign_end)))
+
+struct telemetry_shmti {
+	u32 flags;
+	void __iomem *base;
+	u32 last_magic;
+	struct scmi_telemetry_shmti_info info;
+};
+
+#define SHMTI_EPLG(s)						\
+	({							\
+		struct telemetry_shmti *_s = (s);		\
+		struct eplg __iomem *_eplg;			\
+								\
+		_eplg = _s->base + _s->info.len - TDCF_EPLG_SZ;	\
+		(_eplg);					\
+	})
+
 enum timestamps {
 	TSTAMP_NONE = 0,
 	TSTAMP_LINE = 1,
@@ -119,6 +179,7 @@ struct telemetry_de {
 	u32 ts_rate;
 	bool enumerated;
 	void __iomem *base;
+	struct eplg __iomem *eplg;
 	u32 sid;
 	u32 offset;
 	/* NOTE THAT DE data_sz is registered in scmi_telemetry_de */
@@ -137,6 +198,7 @@ struct telemetry_info {
 	unsigned int num_des_tstamp;
 	unsigned int default_blk_ts_rate;
 	const struct scmi_protocol_handle *ph;
+	struct telemetry_shmti *shmti;
 	struct telemetry_de *tdes;
 	struct scmi_telemetry_group *grps;
 	struct xarray xa_des;
@@ -787,6 +849,146 @@ scmi_telemetry_enumerate_common_intervals(struct telemetry_info *ti)
 					ti->info.intervals);
 }
 
+static int iter_shmti_update_state(struct scmi_iterator_state *st,
+				   const void *response, void *priv)
+{
+	const struct scmi_msg_resp_telemetry_shmti_list *r = response;
+
+	st->num_returned = le32_get_bits(r->num_shmti, GENMASK(15, 0));
+	st->num_remaining = le32_get_bits(r->num_shmti, GENMASK(31, 16));
+
+	if (st->rx_len < (sizeof(*r) + sizeof(r->desc[0]) * st->num_returned))
+		return -EINVAL;
+
+	return 0;
+}
+
+static inline int
+scmi_telemetry_shmti_validate(struct device *dev, struct telemetry_shmti *shmti)
+{
+	struct tdcf __iomem *tdcf = shmti->base;
+	u32 sign_start, sign_end;
+
+	sign_start = TDCF_START_SIGNATURE(tdcf);
+	sign_end = TDCF_END_SIGNATURE(SHMTI_EPLG(shmti));
+
+	if (sign_start != SIGNATURE_START || sign_end != SIGNATURE_END) {
+		dev_err(dev,
+			"BAD signature for SHMTI ID:%u @phys:%pK - START:0x%04X END:0x%04X\n",
+			shmti->info.sid, shmti->base, sign_start, sign_end);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int iter_shmti_process_response(const struct scmi_protocol_handle *ph,
+				       const void *response,
+				       struct scmi_iterator_state *st,
+				       void *priv)
+{
+	const struct scmi_msg_resp_telemetry_shmti_list *r = response;
+	struct telemetry_info *ti = priv;
+	struct telemetry_shmti *shmti;
+	const struct scmi_shmti_desc *desc;
+	void __iomem *addr;
+	u64 phys_addr;
+	u32 len;
+
+	desc = &r->desc[st->loop_idx];
+	shmti = &ti->shmti[st->desc_index + st->loop_idx];
+
+	shmti->info.sid = le32_to_cpu(desc->id);
+	shmti->flags = le32_to_cpu(desc->flags);
+	phys_addr = le32_to_cpu(desc->addr_low);
+	phys_addr |= (u64)le32_to_cpu(desc->addr_high) << 32;
+
+	if (!IS_ALIGNED(phys_addr, 4)) {
+		dev_err(ph->dev,
+			"SHMTI ID %u is NOT 32-bit aligned (paddr:0x%llX). Abort.\n",
+			shmti->info.sid, phys_addr);
+		return -EINVAL;
+	}
+
+	len = le32_to_cpu(desc->length);
+	if (len < SHMTI_MIN_SIZE) {
+		dev_err(ph->dev, "Invalid length for SHMTI ID:%u len:%u\n",
+			shmti->info.sid, len);
+		return -EINVAL;
+	}
+
+	/* SHMTI base phys_addr SHOULD be 64bit aligned by the SCMI spec */
+	if (!IS_ALIGNED(phys_addr, 8))
+		dev_warn(ph->dev,
+			 "SHMTI ID:%u is NOT 64bit aligned (paddr:0x%llX)\n",
+			 shmti->info.sid, phys_addr);
+
+	addr = devm_ioremap(ph->dev, phys_addr, len);
+	if (!addr)
+		return -EADDRNOTAVAIL;
+
+	shmti->base = addr;
+	shmti->info.len = len;
+	shmti->info.phys = phys_addr;
+	shmti->info.offset = shmti->info.phys & ~PAGE_MASK;
+
+	return scmi_telemetry_shmti_validate(ph->dev, shmti);
+}
+
+static int scmi_telemetry_shmti_list(const struct scmi_protocol_handle *ph,
+				     struct telemetry_info *ti)
+{
+	struct scmi_iterator_ops ops = {
+		.prepare_message = iter_tlm_prepare_message,
+		.update_state = iter_shmti_update_state,
+		.process_response = iter_shmti_process_response,
+	};
+	void *iter;
+
+	iter = ph->hops->iter_response_init(ph, &ops, ti->num_shmti,
+					    TELEMETRY_LIST_SHMTI,
+					    sizeof(u32), ti);
+	if (IS_ERR(iter))
+		return PTR_ERR(iter);
+
+	return ph->hops->iter_response_run(iter);
+}
+
+static int scmi_telemetry_enumerate_shmti(struct telemetry_info *ti)
+{
+	const struct scmi_protocol_handle *ph = ti->ph;
+	struct scmi_telemetry_shmti_info **shmtis;
+	int ret;
+
+	if (!ti->num_shmti)
+		return 0;
+
+	ti->shmti = devm_kcalloc(ph->dev, ti->num_shmti, sizeof(*ti->shmti),
+				 GFP_KERNEL);
+	if (!ti->shmti)
+		return -ENOMEM;
+
+	ret = scmi_telemetry_shmti_list(ph, ti);
+	if (ret) {
+		dev_err(ph->dev, "Cannot get SHMTI list descriptors");
+		return ret;
+	}
+
+	/* Expose initialized SHMTIs references */
+	shmtis = devm_kcalloc(ph->dev, ti->num_shmti,
+			      sizeof(*shmtis), GFP_KERNEL);
+	if (!shmtis)
+		return -ENOMEM;
+
+	for (int i = 0; i < ti->num_shmti; i++)
+		shmtis[i] = &ti->shmti[i].info;
+
+	ti->info.shmtis = shmtis;
+	ti->info.base.num_shmtis = ti->num_shmti;
+
+	return 0;
+}
+
 static const struct scmi_telemetry_info *
 scmi_telemetry_info_get(const struct scmi_protocol_handle *ph)
 {
@@ -1106,6 +1308,12 @@ static int scmi_telemetry_protocol_init(const struct scmi_protocol_handle *ph)
 	ret = scmi_telemetry_enumerate_common_intervals(ti);
 	if (ret) {
 		dev_err(dev, FW_BUG "Cannot enumerate update intervals. Abort.\n");
+		return ret;
+	}
+
+	ret = scmi_telemetry_enumerate_shmti(ti);
+	if (ret) {
+		dev_err(dev, FW_BUG "Cannot enumerate SHMTIs. Abort.\n");
 		return ret;
 	}
 

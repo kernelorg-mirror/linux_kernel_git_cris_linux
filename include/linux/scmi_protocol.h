@@ -826,6 +826,57 @@ struct scmi_pinctrl_proto_ops {
 	int (*pin_free)(const struct scmi_protocol_handle *ph, u32 pin);
 };
 
+enum scmi_telemetry_de_type {
+	SCMI_TLM_DE_TYPE_USPECIFIED,
+	SCMI_TLM_DE_TYPE_ACCUMUL_IDLE_RESIDENCY,
+	SCMI_TLM_DE_TYPE_ACCUMUL_IDLE_COUNTS,
+	SCMI_TLM_DE_TYPE_ACCUMUL_OTHERS,
+	SCMI_TLM_DE_TYPE_INSTA_IDLE_STATE,
+	SCMI_TLM_DE_TYPE_INSTA_OTHERS,
+	SCMI_TLM_DE_TYPE_AVERAGE,
+	SCMI_TLM_DE_TYPE_STATUS,
+	SCMI_TLM_DE_TYPE_RESERVED_START,
+	SCMI_TLM_DE_TYPE_RESERVED_END = 0xef,
+	SCMI_TLM_DE_TYPE_OEM_START = 0xf0,
+	SCMI_TLM_DE_TYPE_OEM_END = 0xff,
+};
+
+enum scmi_telemetry_compo_type {
+	SCMI_TLM_COMPO_TYPE_USPECIFIED,
+	SCMI_TLM_COMPO_TYPE_CPU,
+	SCMI_TLM_COMPO_TYPE_CLUSTER,
+	SCMI_TLM_COMPO_TYPE_GPU,
+	SCMI_TLM_COMPO_TYPE_NPU,
+	SCMI_TLM_COMPO_TYPE_INTERCONNECT,
+	SCMI_TLM_COMPO_TYPE_MEM_CNTRL,
+	SCMI_TLM_COMPO_TYPE_L1_CACHE,
+	SCMI_TLM_COMPO_TYPE_L2_CACHE,
+	SCMI_TLM_COMPO_TYPE_L3_CACHE,
+	SCMI_TLM_COMPO_TYPE_LL_CACHE,
+	SCMI_TLM_COMPO_TYPE_SYS_CACHE,
+	SCMI_TLM_COMPO_TYPE_DISP_CNTRL,
+	SCMI_TLM_COMPO_TYPE_IPU,
+	SCMI_TLM_COMPO_TYPE_CHIPLET,
+	SCMI_TLM_COMPO_TYPE_PACKAGE,
+	SCMI_TLM_COMPO_TYPE_SOC,
+	SCMI_TLM_COMPO_TYPE_SYSTEM,
+	SCMI_TLM_COMPO_TYPE_SMCU,
+	SCMI_TLM_COMPO_TYPE_ACCEL,
+	SCMI_TLM_COMPO_TYPE_BATTERY,
+	SCMI_TLM_COMPO_TYPE_CHARGER,
+	SCMI_TLM_COMPO_TYPE_PMIC,
+	SCMI_TLM_COMPO_TYPE_BOARD,
+	SCMI_TLM_COMPO_TYPE_MEMORY,
+	SCMI_TLM_COMPO_TYPE_PERIPH,
+	SCMI_TLM_COMPO_TYPE_PERIPH_SUBC,
+	SCMI_TLM_COMPO_TYPE_LID,
+	SCMI_TLM_COMPO_TYPE_DISPLAY,
+	SCMI_TLM_COMPO_TYPE_RESERVED_START = 0x1d,
+	SCMI_TLM_COMPO_TYPE_RESERVED_END = 0xdf,
+	SCMI_TLM_COMPO_TYPE_OEM_START = 0xe0,
+	SCMI_TLM_COMPO_TYPE_OEM_END = 0xff,
+};
+
 #define	SCMI_TLM_GET_UPDATE_INTERVAL_SECS(x)	(FIELD_GET(GENMASK(20, 5), (x)))
 #define SCMI_TLM_GET_UPDATE_INTERVAL_EXP(x)	(sign_extend32((x), 4))
 
@@ -905,6 +956,13 @@ struct scmi_telemetry_base_info {
 	unsigned int num_shmtis;
 };
 
+struct scmi_telemetry_shmti_info {
+	unsigned int sid;
+	unsigned int len;
+	unsigned long offset;
+	phys_addr_t phys;
+};
+
 struct scmi_telemetry_info {
 	bool single_read_support;
 	bool continuous_update_support;
@@ -914,6 +972,7 @@ struct scmi_telemetry_info {
 	struct scmi_telemetry_base_info base;
 	unsigned int active_update_interval;
 	struct scmi_telemetry_intervals *intervals;
+	struct scmi_telemetry_shmti_info **shmtis;
 };
 
 /**
