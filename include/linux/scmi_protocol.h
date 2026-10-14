@@ -13,6 +13,7 @@
 #include <linux/device.h>
 #include <linux/notifier.h>
 #include <linux/types.h>
+#include <linux/uuid.h>
 
 #define SCMI_MAX_STR_SIZE		64
 #define SCMI_SHORT_NAME_MAX_SIZE	16
@@ -825,6 +826,37 @@ struct scmi_pinctrl_proto_ops {
 	int (*pin_free)(const struct scmi_protocol_handle *ph, u32 pin);
 };
 
+struct scmi_telemetry_de_info {
+	unsigned int id;
+	unsigned int grp_id;
+	unsigned int data_sz;
+	unsigned int type;
+	unsigned int unit;
+	int unit_exp;
+	unsigned int ts_rate;
+	unsigned int instance_id;
+	unsigned int compo_instance_id;
+	unsigned int compo_type;
+	bool persistent;
+	char name[16];
+};
+
+struct scmi_telemetry_de {
+	bool tstamp_support;
+	bool fc_support;
+	bool name_support;
+	struct scmi_telemetry_de_info *info;
+	bool enabled;
+	bool tstamp_enabled;
+};
+
+struct scmi_telemetry_res_info {
+	bool fully_enumerated;
+	unsigned int num_des;
+	struct scmi_telemetry_de **des;
+	struct scmi_telemetry_de_info *dei_store;
+};
+
 struct scmi_telemetry_base_info {
 	unsigned int version;
 	uuid_t primary_revision;
@@ -848,9 +880,15 @@ struct scmi_telemetry_info {
  *	by SCMI Telemetry Protocol
  *
  * @info_get: get the general Telemetry information.
+ * @de_lookup: get a specific DE descriptor from the DE id.
+ * @res_get: get a reference to the Telemetry resources descriptor.
  */
 struct scmi_telemetry_proto_ops {
 	const struct scmi_telemetry_info __must_check *(*info_get)
+		(const struct scmi_protocol_handle *ph);
+	const struct scmi_telemetry_de __must_check *(*de_lookup)
+		(const struct scmi_protocol_handle *ph, u32 id);
+	const struct scmi_telemetry_res_info __must_check *(*res_get)
 		(const struct scmi_protocol_handle *ph);
 };
 
