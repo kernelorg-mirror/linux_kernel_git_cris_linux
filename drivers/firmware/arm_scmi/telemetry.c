@@ -133,6 +133,21 @@ struct scmi_msg_resp_telemetry_update_intervals {
 	__le32 intervals[];
 };
 
+struct scmi_msg_telemetry_de_enabled_list {
+	__le32 index;
+	__le32 flags;
+};
+
+struct scmi_enabled_de_desc {
+	__le32 id;
+	__le32 mode;
+};
+
+struct scmi_msg_resp_telemetry_de_enabled_list {
+	__le32 flags;
+	struct scmi_enabled_de_desc array[];
+};
+
 struct scmi_msg_telemetry_de_configure {
 	__le32 identifier;
 	__le32 flags;
@@ -173,6 +188,20 @@ struct scmi_msg_telemetry_config_set {
 #define	TELEMETRY_SET_SELECTOR_ORPHANS	TELEMETRY_SET_SELECTOR(TLM_ORPHANS)
 #define	TELEMETRY_SET_SELECTOR_GROUP	TELEMETRY_SET_SELECTOR(TLM_GROUP)
 #define	TELEMETRY_SET_SELECTOR_ALL	TELEMETRY_SET_SELECTOR(TLM_ALL)
+	__le32 sampling_rate;
+};
+
+struct scmi_msg_telemetry_config_get {
+	__le32 group_identifier;
+	__le32 flags;
+#define TELEMETRY_GET_SELECTOR(x)	(FIELD_PREP(GENMASK(3, 0), (x)))
+#define	TELEMETRY_GET_SELECTOR_ORPHANS	TELEMETRY_GET_SELECTOR(TLM_ORPHANS)
+#define	TELEMETRY_GET_SELECTOR_GROUP	TELEMETRY_GET_SELECTOR(TLM_GROUP)
+#define	TELEMETRY_GET_SELECTOR_ALL	TELEMETRY_GET_SELECTOR(TLM_ALL)
+};
+
+struct scmi_msg_resp_telemetry_config_get {
+	__le32 control;
 	__le32 sampling_rate;
 };
 
@@ -501,6 +530,8 @@ static inline bool scmi_tde_has_tstamp(struct telemetry_de *t)
 	return t->de.tstamp_support && t->de.tstamp_enabled;
 }
 
+#define DE_ENABLED_WITH_TSTAMP	2
+
 enum de_state {
 	ENA_STATE,
 	ENA_TSTAMP,
@@ -676,12 +707,6 @@ static int scmi_telemetry_tde_register(struct telemetry_info *ti,
 	ret = xa_insert(&ti->xa_des, tde->de.info->id, &tde->de, GFP_KERNEL);
 	if (ret)
 		goto err;
-
-	/* Add to FastChannels list */
-	if (tde->de.fc_support) {
-		scmi_telemetry_uuid_link(tde, ti->primary_uuid);
-		list_add(&tde->item, &ti->fcs_des);
-	}
 
 	/* ... and in the general array */
 	rinfo->des[rinfo->num_des] = &tde->de;
@@ -948,6 +973,7 @@ static int scmi_telemetry_de_descriptor_parse(struct telemetry_info *ti,
 	const struct scmi_de_desc *desc = *next;
 	struct device *dev = ti->ph->dev;
 	size_t payld_sz = sizeof(*desc);
+	bool fc_support;
 	int ret;
 
 	lockdep_assert_held(&tde->mtx);
@@ -955,6 +981,12 @@ static int scmi_telemetry_de_descriptor_parse(struct telemetry_info *ti,
 	if (*rx_len < payld_sz)
 		return -ENOSPC;
 
+	fc_support = IS_FC_SUPPORTED(desc);
+	/* Bail-out if already discovered as a SHMTI-based DE */
+	if (fc_support && tde->base)
+		return -EPROTO;
+
+	tde->de.fc_support = fc_support;
 	tde->de.info->id = le32_to_cpu(desc->de_id);
 	tde->de.info->grp_id = le32_to_cpu(desc->group_id);
 	tde->de.info->data_sz = le32_to_cpu(desc->de_data_sz);
@@ -967,7 +999,6 @@ static int scmi_telemetry_de_descriptor_parse(struct telemetry_info *ti,
 	tde->de.info->persistent = IS_PERSISTENT(desc);
 	tde->ts_type = TSTAMP_SUPPORT(desc);
 	tde->de.tstamp_support = !!tde->ts_type;
-	tde->de.fc_support = IS_FC_SUPPORTED(desc);
 	tde->de.name_support = IS_NAME_SUPPORTED(desc);
 	/* Update DE_DESCRIPTOR size for the next iteration */
 	*next += sizeof(*desc);
@@ -984,8 +1015,13 @@ static int scmi_telemetry_de_descriptor_parse(struct telemetry_info *ti,
 		/* Variably sized depending on TS support */
 		*next += sizeof(*line_ts_rate);
 	} else if (IS_TDE_TS_BLK(tde)) {
-		/* Setup default BLK TS value at first */
-		tde->de.info->ts_rate = ti->default_blk_ts_rate;
+		/*
+		 * Setup default BLK TS rate value at first, if it has NOT
+		 * already been picked from the BLK_TS line by the boot-on
+		 * SCAN_UPDATE.
+		 */
+		if (!tde->de.info->ts_rate)
+			tde->de.info->ts_rate = ti->default_blk_ts_rate;
 	} else if (!IS_TDE_TS_NONE(tde)) {
 		dev_warn(dev, "Unknown TDE timestamp type %u\n", tde->ts_type);
 		return -EPROTO;
@@ -1074,8 +1110,230 @@ static int iter_de_descr_process_response(const struct scmi_protocol_handle *ph,
 		}
 	}
 
+	/* Add to FastChannels list */
+	if (tde->de.fc_support) {
+		scmi_telemetry_uuid_link(tde, ti->primary_uuid);
+		list_add(&tde->item, &ti->fcs_des);
+	}
+
+	/* TS is NOT supported clear any enabled state possibly at boot-on */
+	if (!tde->de.tstamp_support)
+		scmi_telemetry_de_state_update(ti, ENA_TSTAMP,
+					       &tde->de.tstamp_enabled, false);
+
 	/* Count timestamped DEs */
 	ti->num_des_tstamp += !!tde->de.tstamp_support;
+
+	return 0;
+}
+
+static int scmi_telemetry_config_lookup(struct telemetry_info *ti,
+					unsigned int grp_id, bool *enabled,
+					unsigned int *active_update_interval,
+					enum scmi_telemetry_collection *mode,
+					bool ignore_groups)
+{
+	const struct scmi_protocol_handle *ph = ti->ph;
+	struct scmi_msg_telemetry_config_get *msg;
+	struct scmi_msg_resp_telemetry_config_get *resp;
+	bool is_group = grp_id != SCMI_TLM_GRP_INVALID;
+	struct scmi_xfer *t;
+	u32 flags;
+	int ret;
+
+	ret = ph->xops->xfer_get_init(ph, TELEMETRY_CONFIG_GET,
+				      sizeof(*msg), sizeof(*resp), &t);
+	if (ret)
+		return ret;
+
+	msg = t->tx.buf;
+	msg->group_identifier = cpu_to_le32(grp_id);
+
+	/* Spec mandates the ALL selector when per-group config not available */
+	if (!ti->info.per_group_config_support || ignore_groups)
+		flags = TELEMETRY_GET_SELECTOR_ALL;
+	else
+		flags = !is_group ? TELEMETRY_GET_SELECTOR_ORPHANS :
+			TELEMETRY_GET_SELECTOR_GROUP;
+
+	msg->flags = cpu_to_le32(flags);
+
+	resp = t->rx.buf;
+	ret = ph->xops->do_xfer(ph, t);
+	if (!ret) {
+		*enabled = le32_get_bits(resp->control, TELEMETRY_ENABLE);
+		*mode = le32_get_bits(resp->control, TELEMETRY_MODE);
+		if (!is_group)
+			ti->streaming_mode =
+				*mode == SCMI_TLM_COLLECTION_NOTIFICATION;
+		*active_update_interval =
+			SCMI_TLM_GET_UPDATE_INTERVAL(le32_to_cpu(resp->sampling_rate));
+	}
+
+	ph->xops->xfer_put(ph, t);
+
+	return ret;
+}
+
+static void iter_enabled_list_prepare_message(void *message,
+					      unsigned int desc_index,
+					      const void *priv)
+{
+	struct scmi_msg_telemetry_de_enabled_list *msg = message;
+
+	msg->index = cpu_to_le32(desc_index);
+	msg->flags = 0;
+}
+
+static int iter_enabled_list_update_state(struct scmi_iterator_state *st,
+					  const void *response, void *priv)
+{
+	const struct scmi_msg_resp_telemetry_de_enabled_list *r = response;
+
+	st->num_returned = le32_get_bits(r->flags, GENMASK(15, 0));
+	st->num_remaining = le32_get_bits(r->flags, GENMASK(31, 16));
+
+	if (st->rx_len < (sizeof(*r) + sizeof(r->array[0]) * st->num_returned))
+		return -EINVAL;
+
+	/*
+	 * total enabled is not declared previously anywhere so we
+	 * assume it's returned+remaining on first call.
+	 */
+	if (!st->max_resources)
+		st->max_resources = st->num_returned + st->num_remaining;
+
+	return 0;
+}
+
+static int
+iter_enabled_list_process_response(const struct scmi_protocol_handle *ph,
+				   const void *response,
+				   struct scmi_iterator_state *st, void *priv)
+{
+	const struct scmi_msg_resp_telemetry_de_enabled_list *r = response;
+	const struct scmi_enabled_de_desc *desc;
+	struct telemetry_info *ti = priv;
+	struct telemetry_de *tde;
+	u32 de_id;
+	int ret;
+
+	desc = &r->array[st->loop_idx];
+	de_id = le32_to_cpu(desc->id);
+	if (scmi_telemetry_tde_lookup(ti, de_id)) {
+		dev_err(ph->dev,
+			"Found INVALID DE with DUPLICATED ID:0x%08X\n", de_id);
+		return -EINVAL;
+	}
+
+	tde = scmi_telemetry_tde_get(ti, de_id);
+	if (IS_ERR(tde))
+		return PTR_ERR(tde);
+
+	guard(mutex)(&tde->mtx);
+	tde->de.info->id = de_id;
+	tde->de.enabled = true;
+	tde->de.tstamp_enabled = le32_to_cpu(desc->mode) == DE_ENABLED_WITH_TSTAMP;
+	/*
+	 * Guessing that, if a DE is reported as enabled with timestamp, it has
+	 * to support timestamp: NOTE THAT the timestamp type (tde->ts_type) can
+	 * ONLY be discovered later by  DE_DESCRIPTION.
+	 */
+	tde->de.tstamp_support = tde->de.tstamp_enabled;
+
+	ret = scmi_telemetry_tde_register(ti, tde);
+	if (ret) {
+		scmi_telemetry_free_tde_put(ti, tde);
+		return ret;
+	}
+
+	scmi_telemetry_de_state_update(ti, ENA_STATE, NULL, true);
+	if (tde->de.tstamp_enabled)
+		scmi_telemetry_de_state_update(ti, ENA_TSTAMP, NULL, true);
+
+	dev_dbg(ph->dev, "Registered new ENABLED DE with ID:0x%08X\n",
+		tde->de.info->id);
+
+	return 0;
+}
+
+static int scmi_telemetry_enumerate_des_enabled_list(struct telemetry_info *ti)
+{
+	const struct scmi_protocol_handle *ph = ti->ph;
+	struct scmi_telemetry_res_info *rinfo;
+	struct scmi_iterator_ops ops = {
+		.prepare_message = iter_enabled_list_prepare_message,
+		.update_state = iter_enabled_list_update_state,
+		.process_response = iter_enabled_list_process_response,
+	};
+	void *iter;
+	int ret;
+
+	iter = ph->hops->iter_response_init(ph, &ops, 0,
+					    TELEMETRY_DE_ENABLED_LIST,
+					    sizeof(u32) * 2, ti);
+	if (IS_ERR(iter))
+		return PTR_ERR(iter);
+
+	ret = ph->hops->iter_response_run(iter);
+	if (ret)
+		return ret;
+
+	/* Get rinfo as it is...without triggering an enumeration */
+	rinfo = __scmi_telemetry_resources_get(ti);
+
+	dev_info(ti->ph->dev, "Found %u enabled DEs.\n", rinfo->num_des);
+
+	return 0;
+}
+
+static int scmi_telemetry_initial_state_lookup(struct telemetry_info *ti)
+{
+	struct device *dev = ti->ph->dev;
+	int ret;
+
+	/* Discover the initial state ONLY for DEs, ignoring groups */
+	ret = scmi_telemetry_config_lookup(ti, SCMI_TLM_GRP_INVALID,
+					   &ti->info.enabled,
+					   &ti->info.active_update_interval,
+					   &ti->info.current_mode, true);
+	if (ret)
+		return ret;
+
+	if (!ti->info.enabled)
+		return 0;
+
+	/*
+	 * When Telemetry is found already enabled on the platform, proceed with
+	 * passive discovery using DE_ENABLED_LIST and TDCF scanning: note that
+	 * this CAN only discover DEs exposed via SHMTIs.
+	 * FastChannel DEs need a proper DE_DESCRIPTION enumeration, while, even
+	 * though incoming Notifications could be used for passive discovery too,
+	 * it would carry a considerable risk of assimilating trash as DEs.
+	 */
+	dev_info(dev,
+		 "Telemetry found enabled with update interval %lux10^%d mode:%u\n",
+		 SCMI_TLM_GET_UPDATE_INTERVAL_SECS(ti->info.active_update_interval),
+		 SCMI_TLM_GET_UPDATE_INTERVAL_EXP(ti->info.active_update_interval),
+		 ti->info.current_mode);
+	/*
+	 * Query enabled DEs list: collect states. It will include DEs from any
+	 * interface. Enabled groups still NOT enumerated.
+	 */
+	ret = scmi_telemetry_enumerate_des_enabled_list(ti);
+	if (ret) {
+		dev_err(dev, FW_BUG "Cannot query enabled DE list. Abort.\n");
+		return ret;
+	}
+
+	/* Discover DEs on SHMTis: collect states/offsets/values */
+	for (int id = 0; id < ti->num_shmti; id++) {
+		ret = scmi_telemetry_shmti_scan(ti, id, SCAN_UPDATE);
+		if (ret)
+			dev_warn(dev,
+				 "Failed discovery-scan of SHMTI ID:%d - ret:%d\n",
+				 id, ret);
+	}
 
 	return 0;
 }
@@ -2225,8 +2483,17 @@ static void scmi_telemetry_tdcf_data_parse(struct telemetry_info *ti,
 
 		trace_scmi_tlm_access(de_id, "DE_LOCATION_UPDATED", 0, 0);
 
-		dev_dbg(dev, "TDCF-updated DE_ID:0x%08X - shmti:%pK  offset:%u\n",
-			tde->de.info->id, tde->base, tde->offset);
+		/* Just in case it was passively discovered boot-on */
+		if (IS_TDE_TS_NONE(tde)) {
+			if (use_blk_ts)
+				tde->ts_type = TSTAMP_BLK;
+			else if (LINE_TS_VALID_RAW(meta))
+				tde->ts_type = TSTAMP_LINE;
+		}
+
+		dev_dbg(dev,
+			"TDCF-updated DE_ID:0x%08X - shmti:%pK  offset:%u  ts_type:%d\n",
+			tde->de.info->id, tde->base, tde->offset, tde->ts_type);
 	}
 
 	/*
@@ -3957,6 +4224,12 @@ static int scmi_telemetry_protocol_init(const struct scmi_protocol_handle *ph)
 	ret = scmi_telemetry_enumerate_shmti(ti);
 	if (ret) {
 		dev_err(dev, FW_BUG "Cannot enumerate SHMTIs. Abort.\n");
+		return ret;
+	}
+
+	ret = scmi_telemetry_initial_state_lookup(ti);
+	if (ret) {
+		dev_err(dev, FW_BUG "Cannot retrieve initial state. Abort.\n");
 		return ret;
 	}
 
