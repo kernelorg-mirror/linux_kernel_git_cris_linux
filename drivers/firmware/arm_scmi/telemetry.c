@@ -30,6 +30,7 @@
 #include <linux/uuid.h>
 #include <linux/xarray.h>
 
+#include "errors.h"
 #include "protocols.h"
 #include "notify.h"
 
@@ -67,6 +68,13 @@ struct scmi_msg_resp_telemetry_protocol_attributes {
 #define SUPPORTS_RESET(x)		(le32_get_bits((x), BIT(17)))
 #define SUPPORTS_FC(x)			(le32_get_bits((x), BIT(16)))
 	__le32 default_blk_ts_rate;
+};
+
+struct scmi_telemetry_update_notify_payld {
+	__le32 agent_id;
+	__le32 status;
+	__le32 num_dwords;
+	__le32 array[] __counted_by_le(num_dwords);
 };
 
 struct scmi_shmti_desc {
@@ -552,11 +560,15 @@ struct telemetry_info {
 	/* Protect global and per-group configuration data */
 	struct mutex config_mtx;
 	struct scmi_telemetry_info info;
+	struct notifier_block telemetry_nb;
 	atomic_t rinfo_initializing;
 	struct completion rinfo_initdone;
 	struct scmi_telemetry_res_info *rinfo;
 	struct scmi_telemetry_res_info *(*res_get)(struct telemetry_info *ti);
 };
+
+#define telemetry_nb_to_info(x)	\
+	container_of(x, struct telemetry_info, telemetry_nb)
 
 static struct scmi_telemetry_res_info *
 __scmi_telemetry_resources_get(struct telemetry_info *ti);
@@ -3831,9 +3843,9 @@ scmi_telemetry_msg_payld_process(struct telemetry_info *ti,
 	while (next < num_dwords) {
 		struct payload *payld = (struct payload *)&dwords[next];
 		struct scmi_telemetry_de_sample sample = {};
+		u32 de_id, meta = le32_to_cpu(payld->meta);
 		struct scmi_telemetry_de *de;
 		struct telemetry_de *tde;
-		u32 de_id, meta = le32_to_cpu(payld->meta);
 		unsigned int wlen;
 
 		wlen = LINE_LENGTH_WORDS_RAW(meta);
@@ -3874,13 +3886,16 @@ scmi_telemetry_msg_payld_process(struct telemetry_info *ti,
 		}
 
 		tde->cached_msg = cacheable;
-
 		sample.val = LINE_DATA_GET_RAW(&payld->tsl);
 		sample.tstamp = HAS_LINE_EXT_RAW(meta) &&
 			LINE_TS_VALID_RAW(meta) ? LINE_TSTAMP_GET_RAW(&payld->tsl) : 0;
 
 		/* Update the cache holding the TDE mutex */
 		scmi_telemetry_tde_cache_update(tde, &sample, NULL);
+
+		/* Link notifications to Primary UUID */
+		if (cacheable)
+			scmi_telemetry_uuid_link(tde, ti->primary_uuid);
 
 		trace_scmi_tlm_collect(sample.tstamp, de->info->id, sample.val,
 				       "MESSAGE");
@@ -4061,6 +4076,148 @@ static const struct scmi_telemetry_proto_ops tlm_proto_ops = {
 	.des_sample_get = scmi_telemetry_des_sample_get,
 	.reset = scmi_telemetry_reset,
 };
+
+static bool
+scmi_telemetry_notify_supported(const struct scmi_protocol_handle *ph,
+				u8 evt_id, u32 src_id)
+{
+	struct telemetry_info *ti = ph->get_priv(ph);
+
+	return ti->info.continuous_update_support;
+}
+
+static int
+scmi_telemetry_set_notify_enabled(const struct scmi_protocol_handle *ph,
+				  u8 evt_id, u32 src_id, bool enable)
+{
+	/*
+	 * As defined by the specification, SCMI Telemetry notifications are a
+	 * kind of their own: the enable process deviates slightly from usual
+	 * notifications behaviour and a notifier has to be registered anyway
+	 * right after protocol initialization if such notifications are
+	 * supported at all by the platform.
+	 * IOW, SCMI Telemetry notifications are in fact always enabled when
+	 * supported, so this helper needs to do nothing but succeed.
+	 */
+	return 0;
+}
+
+static void *
+scmi_telemetry_fill_custom_report(const struct scmi_protocol_handle *ph,
+				  u8 evt_id, ktime_t timestamp,
+				  const void *payld, size_t payld_sz,
+				  void *report, u32 *src_id)
+{
+	const struct scmi_telemetry_update_notify_payld *p = payld;
+	struct scmi_telemetry_update_report *r = report;
+	size_t dwords_sz, msg_payld_sz;
+
+	/* At least sized as an empty notification */
+	if (payld_sz < sizeof(*p))
+		return NULL;
+
+	r->timestamp = timestamp;
+	r->agent_id = le32_to_cpu(p->agent_id);
+	r->status = scmi_to_linux_errno(le32_to_cpu(p->status));
+	r->num_dwords = le32_to_cpu(p->num_dwords);
+
+	/*Check boundaries and wraparounds */
+	if (check_mul_overflow(r->num_dwords, sizeof(r->dwords[0]), &dwords_sz))
+		return NULL;
+
+	if (check_add_overflow(sizeof(*p), dwords_sz, &msg_payld_sz))
+		return NULL;
+
+	if (msg_payld_sz > payld_sz)
+		return NULL;
+
+	/*
+	 * Allocated dwords and report are sized as max_msg_size, so as
+	 * to allow for the maximum payload permitted by the configured
+	 * transport. Overflow is not possible since out-of-size messages
+	 * are dropped at the transport layer.
+	 */
+	if (r->num_dwords)
+		memcpy_from_le32(r->dwords, p->array, r->num_dwords);
+
+	*src_id = 0;
+
+	return r;
+}
+
+static const struct scmi_event tlm_events[] = {
+	{
+		.id = SCMI_EVENT_TELEMETRY_UPDATE,
+		.max_payld_sz = 0,
+		.max_report_sz = 0,
+	},
+};
+
+static const struct scmi_event_ops tlm_event_ops = {
+	.is_notify_supported = scmi_telemetry_notify_supported,
+	.set_notify_enabled = scmi_telemetry_set_notify_enabled,
+	.fill_custom_report = scmi_telemetry_fill_custom_report,
+};
+
+static const struct scmi_protocol_events tlm_protocol_events = {
+	.queue_sz = SCMI_PROTO_QUEUE_SZ,
+	.ops = &tlm_event_ops,
+	.evts = tlm_events,
+	.num_events = ARRAY_SIZE(tlm_events),
+	.num_sources = 1,
+};
+
+static int scmi_telemetry_notifier(struct notifier_block *nb,
+				   unsigned long event, void *data)
+{
+	struct scmi_telemetry_update_report *er = data;
+	struct telemetry_info *ti = telemetry_nb_to_info(nb);
+
+	/*
+	 * PARTIAL_ERRORs are reported as -EBADMSG and related lines,
+	 * marked as DATA_INVALID, will be properly skipped by
+	 * scmi_telemetry_msg_payld_process.
+	 */
+	if (er->status && er->status != -EBADMSG) {
+		trace_scmi_tlm_access(0, "BAD_NOTIF_MSG", 0, 0);
+		return NOTIFY_DONE;
+	} else if (er->status == -EBADMSG) {
+		trace_scmi_tlm_access(0, "BAD_NOTIF_PARTIAL_ERROR", 0, 0);
+	}
+
+	trace_scmi_tlm_access(0, "TLM_UPDATE_MSG", 0, 0);
+	/* Lookup the embedded DEs in the notification payload ... */
+	if (er->num_dwords) {
+		size_t payld_bytes = sizeof(er->dwords[0]) * er->num_dwords;
+
+		__le32 *dwords __free(kvfree) =
+			kvzalloc_objs(*dwords, er->num_dwords);
+		if (!dwords) {
+			trace_scmi_tlm_access(0, "TLM_UPDATE_MSG_FAILED", 0, 0);
+			return NOTIFY_DONE;
+		}
+
+		/* The report payload size was bound checked on rx */
+		memcpy_to_le32(dwords, er->dwords, er->num_dwords);
+		/*
+		 * Note that the DEs received via Notifications can only be
+		 * updated that way, and as such are cached at each reception
+		 * and never read on-demand.
+		 */
+		scmi_telemetry_msg_payld_process(ti, er->num_dwords, dwords,
+						 payld_bytes, true);
+	}
+
+	/*
+	 * ...scan the SHMTI/FCs for any other DE updates if streaming mode
+	 * is enabled since it is an indication that someone explcitly requested
+	 * collection by notification.
+	 */
+	if (ti->streaming_mode)
+		scmi_telemetry_scan_update(ti);
+
+	return NOTIFY_OK;
+}
 
 /**
  * scmi_telemetry_resources_alloc  - Resources allocation
@@ -4488,7 +4645,27 @@ static int scmi_telemetry_protocol_init(const struct scmi_protocol_handle *ph)
 
 	ti->info.base.version = ph->version;
 
-	return ph->set_priv(ph, ti);
+	ret = ph->set_priv(ph, ti);
+	if (ret)
+		return ret;
+
+	/*
+	 * Register a notifier anyway straight upon protocol initialization
+	 * since there could be some DEs that are ONLY reported by notifications
+	 * even though the chosen collection method was SHMTI/FCs.
+	 */
+	if (ti->info.continuous_update_support) {
+		ti->telemetry_nb.notifier_call = &scmi_telemetry_notifier;
+		ret = ph->instance_notifier_register(ph, SCMI_EVENT_TELEMETRY_UPDATE,
+						     NULL, &ti->telemetry_nb);
+		if (ret) {
+			dev_err(ph->dev,
+				"Could NOT register Telemetry notifier\n");
+			return ret;
+		}
+	}
+
+	return 0;
 }
 
 static const struct scmi_protocol scmi_telemetry = {
@@ -4496,6 +4673,7 @@ static const struct scmi_protocol scmi_telemetry = {
 	.owner = THIS_MODULE,
 	.instance_init = &scmi_telemetry_protocol_init,
 	.ops = &tlm_proto_ops,
+	.events = &tlm_protocol_events,
 	.supported_version = SCMI_PROTOCOL_SUPPORTED_VERSION,
 };
 
