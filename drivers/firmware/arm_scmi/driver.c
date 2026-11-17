@@ -1356,6 +1356,16 @@ static int scmi_wait_for_reply(struct device *dev, const struct scmi_desc *desc,
 		}
 	}
 
+	/* Check for truncated messages..it will be logged by the caller */
+	if (!ret && !xfer->hdr.status && xfer->expected_rx_len &&
+	    xfer->expected_rx_len != xfer->rx.len) {
+		dev_dbg(dev,
+			"Truncated reply - HDR:%08X  expected:%zd  received:%zd\n",
+			pack_scmi_header(&xfer->hdr), xfer->expected_rx_len,
+			xfer->rx.len);
+		xfer->hdr.status = SCMI_ERR_COMMS;
+	}
+
 	return ret;
 }
 
@@ -1616,6 +1626,8 @@ static int xfer_get_init(const struct scmi_protocol_handle *ph,
 
 	xfer->tx.len = tx_size;
 	xfer->rx.len = rx_size ? : info->desc->max_msg_size;
+	/* When a specific rx_size was specified, check for truncation */
+	xfer->expected_rx_len = rx_size ? : 0;
 	xfer->hdr.type = MSG_TYPE_COMMAND;
 	xfer->hdr.id = msg_id;
 	xfer->hdr.poll_completion = false;
